@@ -184,6 +184,12 @@ footer{text-align:center;font-size:.75rem;color:var(--faint)}
 <script>
 /* ============ CONFIG: edit these ============ */
 const CFG = {
+  // ESP32-S3 local server. Fast path is attempted first; if unreachable,
+  // dashboard controls fall back to ThingSpeak automatically.
+  // Update this address only if the ESP32's DHCP address changes.
+  localBase: "http://10.48.37.137",
+  preferLocalControl: true,
+
   // Data channel (ESP32 writes moisture + flow + pump status here)
   dataChannel: "3519558",
   dataReadKey: "ZSPP51V4CIZQBRNP",
@@ -323,7 +329,45 @@ async function loadLive(fullReload) {
     log("Could not read ThingSpeak: " + e.message, "d");
   }
 }
+async function syncLocalStatus() {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 1800);
+    let res;
+    try {
+      res = await fetch(`${CFG.localBase}/status`, { cache: "no-store", signal: controller.signal });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const j = await res.json();
+    if (j.bed1 >= 0) showBed(0, num(j.bed1), null);
+    if (j.bed2 >= 0) showBed(1, num(j.bed2), null);
+    if (j.flow != null) showFlow(num(j.flow));
+    showPump(Number(j.pump) === 1);
+    if (!lockTimer && Date.now() >= localUiHoldUntil) {
+      $("sv1").checked = Number(j.v1) === 1;
+      $("sv2").checked = Number(j.v2) === 1;
+      prev = [$("sv1").checked, $("sv2").checked];
+    }
+    $("dLink").className = "dot on";
+    $("sLink").textContent = "ESP32 Local";
+    if (j.fault) $("ctlState").textContent = "FLOW FAULT — pump stopped";
+    else $("ctlState").textContent = "Direct local control";
+    return true;
+  } catch (e) {
+    // The Vercel HTTPS page may be blocked from calling an HTTP local IP by the browser.
+    return false;
+  }
+}
+
 async function syncValves() {
+  if (CFG.preferLocalControl) {
+    const ok = await syncLocalStatus();
+    // In local-preferred mode, never let stale ThingSpeak values flip the UI back.
+    if (ok || Date.now() < localUiHoldUntil) return;
+    return; // ThingSpeak remains for charts/history and command fallback, not switch-state sync.
+  }
   if (lockTimer) return; // don't overwrite a pending command
   try {
     const k = CFG.ctlReadKey ? `?api_key=${CFG.ctlReadKey}` : "";
@@ -341,6 +385,7 @@ async function syncValves() {
    - Manual / Fertigation switches on the panel override remote */
 let prev = [false, false];
 let lastWriteAt = 0;
+let localUiHoldUntil = 0; // prevent stale status polls from undoing a fresh tap
 async function onValve(which) {
   if (!authUser) { $("sv"+which).checked = prev[which-1]; openAuth("login"); return; }
   if (!CFG.ctlChannel || !CFG.ctlWriteKey) {
@@ -355,27 +400,60 @@ async function onValve(which) {
   const a = $("sv1").checked, b = $("sv2").checked;
   const pump = a || b ? 1 : 0;
 
-  lockControls(true);
-  $("ctlState").textContent = "Sending…";
+  // Keep the requested toggle state visible while ESP32 applies the command.
+  prev = [a, b];
+  localUiHoldUntil = Date.now() + 2500;
 
-  // field1=pump, field2=valve1, field3=valve2  (ESP32 reads field2 & field3)
-  const url = `https://api.thingspeak.com/update?api_key=${CFG.ctlWriteKey}`
-    + `&field${CFG.ctlFields.pump}=${pump}`
-    + `&field${CFG.ctlFields.valve1}=${a ? 1 : 0}`
-    + `&field${CFG.ctlFields.valve2}=${b ? 1 : 0}`;
+  // Keep toggles responsive while network requests are pending.
+  // Previously they were disabled until fetch completed, making OFF feel stuck.
+  lockControls(false);
+  $("ctlState").textContent = "Sending command…";
 
   try {
+    // Preferred: send directly to the ESP32 local server for near-immediate control.
+    if (CFG.preferLocalControl) {
+      const localUrl = `${CFG.localBase}/cmd?v1=${a ? 1 : 0}&v2=${b ? 1 : 0}`;
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1800);
+        let res;
+        try {
+          res = await fetch(localUrl, { cache: "no-store", signal: controller.signal });
+        } finally {
+          clearTimeout(timeoutId);
+        }
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const reply = await res.json();
+        if (!reply.ok) throw new Error(reply.reason || "ESP32 rejected the command");
+        prev = [a, b];
+        log(!a && !b
+          ? "Local STOP sent. Physical Manual/Fertigation switches still have priority."
+          : `Local command sent: Valve ${a ? "1" : "2"} ${a || b ? "ON" : "OFF"}. ESP32 safety logic remains active.`,
+          "i");
+        $("ctlState").textContent = "Sent to ESP32";
+        await syncLocalStatus();
+        return;
+      } catch (localError) {
+        log("Local IP unavailable from this page/browser: " + localError.message, "w");
+        log("Trying ThingSpeak fallback. Physical OFF may wait until the ESP32's next poll (about 15 seconds).", "i");
+      }
+    }
+
+    // Fallback: ThingSpeak control (ESP32 polls this channel every ~15 s).
+    const url = `https://api.thingspeak.com/update?api_key=${CFG.ctlWriteKey}`
+      + `&field${CFG.ctlFields.pump}=${pump}`
+      + `&field${CFG.ctlFields.valve1}=${a ? 1 : 0}`
+      + `&field${CFG.ctlFields.valve2}=${b ? 1 : 0}`;
     const id = await (await fetch(url)).text();
     if (id.trim() === "0") {
       log("ThingSpeak rate limit (1 write / 15 s). Try again in a few seconds.", "w");
       $("ctlState").textContent = "Rate limited – retry soon";
-      // keep switches as user set them
     } else {
       prev = [a, b];
       lastWriteAt = Date.now();
-      if (!a && !b) log("Remote STOP sent (both valves closed). ESP32 holds stop ~60 s.", "i");
-      else log(`Remote: Valve ${a ? "1" : "2"} OPEN (one at a time). ESP32 applies on next poll (~15 s). Panel Manual/Fert must be OFF.`, "i");
-      $("ctlState").textContent = "Ready";
+      if (!a && !b) log("Remote STOP sent through ThingSpeak (both valves closed).", "i");
+      else log(`ThingSpeak command queued: Valve ${a ? "1" : "2"} OPEN. ESP32 applies it on its next poll (~15 s).`, "i");
+      $("ctlState").textContent = "Queued via ThingSpeak";
     }
   } catch (e) {
     $("sv1").checked = prev[0];
@@ -384,6 +462,7 @@ async function onValve(which) {
     $("ctlState").textContent = "Error";
   }
 
+  // Keep the controls enabled; network delay must not freeze the toggles.
   lockControls(false);
 }
 function lockControls(on) { $("sv1").disabled = $("sv2").disabled = on || !authUser; }
@@ -398,8 +477,13 @@ function startLive() {
     ? "One valve at a time. ESP32 applies remote when Manual & Fertigation switches are OFF. Pump follows the open valve."
     : "Add ctlChannel and ctlWriteKey in CFG to enable valve control.";
   lockControls(false); showPump(false); showFlow(0);
-  log("Reading ThingSpeak every " + CFG.pollMs/1000 + "s", "i");
-  loadLive(true); pollTimer = setInterval(() => loadLive(false), CFG.pollMs);
+  log("ThingSpeak remains enabled for history; trying ESP32 local IP " + CFG.localBase, "i");
+  loadLive(true);
+  syncLocalStatus();
+  pollTimer = setInterval(() => {
+    loadLive(false);
+    if (CFG.preferLocalControl) syncLocalStatus();
+  }, CFG.pollMs);
 }
 $("resetMM").onclick = () => { mm = [{lo:null,hi:null},{lo:null,hi:null}]; ["lo1","hi1","lo2","hi2"].forEach(i => $(i).textContent = "--"); log("Raw min/max reset", "i"); };
 
